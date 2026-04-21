@@ -1,0 +1,9 @@
+/target/
+
+# Sensitive local wallet files
+/wallet.dat
+/wallet*.dat.*
+
+# Local analysis outputs
+/addresses.json
+/balances.json
