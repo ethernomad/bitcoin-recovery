@@ -2,6 +2,7 @@
 name = "bitcoin-recovery"
 version = "0.1.0"
 edition = "2024"
+description = "Tool for recovering Bitcoin wallet data and querying address balances via the Esplora API"
 
 [dependencies]
 anyhow = "1.0"
