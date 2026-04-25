@@ -454,6 +454,7 @@ async fn build_balance_report(
 
     let esplora_base_url = esplora_url.trim_end_matches('/').to_string();
     let mut balance_entries = Vec::with_capacity(extract_report.spendable_addresses.len());
+    let mut running_confirmed_sats = 0_u64;
 
     for (index, address) in extract_report.spendable_addresses.iter().cloned().enumerate() {
         let stats = fetch_address_stats(&client, &esplora_base_url, &address.address).await?;
@@ -464,9 +465,15 @@ async fn build_balance_report(
         let unconfirmed_sats =
             stats.mempool_stats.funded_txo_sum as i64 - stats.mempool_stats.spent_txo_sum as i64;
         let fetched = index + 1;
+        running_confirmed_sats = running_confirmed_sats.saturating_add(confirmed_sats);
 
         if fetched % 100 == 0 || fetched == total_addresses {
-            info!(completed = fetched, total = total_addresses, "Fetched address balances");
+            info!(
+                completed = fetched,
+                total = total_addresses,
+                running_confirmed_btc = format!("{:.8}", running_confirmed_sats as f64 / 100_000_000.0),
+                "Fetched address balances"
+            );
         }
 
         balance_entries.push(BalanceEntry {
