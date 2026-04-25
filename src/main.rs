@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -104,7 +104,7 @@ struct BalanceTotals {
     estimated_confirmed_value_usd: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BalanceEntry {
     address: String,
     public_key: String,
@@ -198,8 +198,7 @@ async fn main() -> Result<()> {
                 network = %extract_report.network,
                 "Loaded extracted addresses"
             );
-            let report = build_balance_report(&extract_report, &esplora, &price_url).await?;
-            write_json(&output, &report)?;
+            let report = build_balance_report(&extract_report, &esplora, &price_url, &output).await?;
             info!(
                 address_count = report.address_count,
                 confirmed_sats = report.totals.confirmed_sats,
@@ -432,6 +431,7 @@ async fn build_balance_report(
     extract_report: &ExtractReport,
     esplora_url: &str,
     price_url: &str,
+    output_path: &Path,
 ) -> Result<BalanceReport> {
     if extract_report.spendable_addresses.is_empty() {
         bail!("input extract report does not contain spendable addresses");
@@ -453,10 +453,36 @@ async fn build_balance_report(
         .context("failed to build HTTP client")?;
 
     let esplora_base_url = esplora_url.trim_end_matches('/').to_string();
-    let mut balance_entries = Vec::with_capacity(extract_report.spendable_addresses.len());
-    let mut running_confirmed_sats = 0_u64;
+    let mut balance_entries = load_resume_balance_entries(extract_report, &esplora_base_url, output_path)?;
+    let mut completed_addresses: HashSet<_> = balance_entries
+        .iter()
+        .map(|entry| entry.address.clone())
+        .collect();
+    let mut running_confirmed_sats: u64 = balance_entries.iter().map(|entry| entry.confirmed_sats).sum();
+
+    if !balance_entries.is_empty() {
+        let resumed_count = balance_entries.len();
+        info!(
+            completed = resumed_count,
+            total = total_addresses,
+            remaining = total_addresses.saturating_sub(resumed_count),
+            running_confirmed_btc = format!("{:.8}", running_confirmed_sats as f64 / 100_000_000.0),
+            output = %output_path.display(),
+            "Resuming balance lookup from saved progress"
+        );
+        println!(
+            "Resuming from {} completed addresses in {}. Skipping {} already-fetched addresses.",
+            resumed_count,
+            output_path.display(),
+            resumed_count
+        );
+    }
 
     for (index, address) in extract_report.spendable_addresses.iter().cloned().enumerate() {
+        if completed_addresses.contains(&address.address) {
+            continue;
+        }
+
         let stats = fetch_address_stats(&client, &esplora_base_url, &address.address).await?;
         let confirmed_sats = stats
             .chain_stats
@@ -476,7 +502,7 @@ async fn build_balance_report(
             );
         }
 
-        balance_entries.push(BalanceEntry {
+        let entry = BalanceEntry {
             address: address.address,
             public_key: address.public_key,
             compressed: address.compressed,
@@ -489,23 +515,14 @@ async fn build_balance_report(
             unconfirmed_sats,
             chain_tx_count: stats.chain_stats.tx_count,
             mempool_tx_count: stats.mempool_stats.tx_count,
-        });
+        };
+
+        completed_addresses.insert(entry.address.clone());
+        balance_entries.push(entry);
+
+        let partial_report = assemble_balance_report(extract_report, &esplora_base_url, None, &balance_entries);
+        write_json(output_path, &partial_report)?;
     }
-
-    balance_entries.sort_by(|left, right| {
-        right
-            .confirmed_sats
-            .cmp(&left.confirmed_sats)
-            .then_with(|| right.unconfirmed_sats.cmp(&left.unconfirmed_sats))
-            .then_with(|| left.address.cmp(&right.address))
-    });
-
-    let confirmed_sats = balance_entries.iter().map(|entry| entry.confirmed_sats).sum();
-    let unconfirmed_sats = balance_entries.iter().map(|entry| entry.unconfirmed_sats).sum();
-    let addresses_with_funds = balance_entries
-        .iter()
-        .filter(|entry| entry.confirmed_sats > 0 || entry.unconfirmed_sats != 0)
-        .count();
 
     info!(price_url = %price_url, "Fetching BTC/USD price");
     let bitcoin_price_usd = match fetch_bitcoin_price_usd(&client, price_url).await {
@@ -518,21 +535,54 @@ async fn build_balance_report(
             None
         }
     };
-    let estimated_confirmed_value_usd = bitcoin_price_usd
-        .map(|price| (confirmed_sats as f64 / 100_000_000.0) * price);
+
+    let report = assemble_balance_report(
+        extract_report,
+        &esplora_base_url,
+        bitcoin_price_usd,
+        &balance_entries,
+    );
+    write_json(output_path, &report)?;
 
     info!(
-        confirmed_sats,
-        unconfirmed_sats,
-        addresses_with_funds,
+        confirmed_sats = report.totals.confirmed_sats,
+        unconfirmed_sats = report.totals.unconfirmed_sats,
+        addresses_with_funds = report.totals.addresses_with_funds,
         "Balance aggregation complete"
     );
 
-    Ok(BalanceReport {
+    Ok(report)
+}
+
+fn assemble_balance_report(
+    extract_report: &ExtractReport,
+    esplora_base_url: &str,
+    bitcoin_price_usd: Option<f64>,
+    balance_entries: &[BalanceEntry],
+) -> BalanceReport {
+    let mut addresses = balance_entries.to_vec();
+    addresses.sort_by(|left, right| {
+        right
+            .confirmed_sats
+            .cmp(&left.confirmed_sats)
+            .then_with(|| right.unconfirmed_sats.cmp(&left.unconfirmed_sats))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+
+    let confirmed_sats = addresses.iter().map(|entry| entry.confirmed_sats).sum();
+    let unconfirmed_sats = addresses.iter().map(|entry| entry.unconfirmed_sats).sum();
+    let addresses_with_funds = addresses
+        .iter()
+        .filter(|entry| entry.confirmed_sats > 0 || entry.unconfirmed_sats != 0)
+        .count();
+    let estimated_confirmed_value_usd = bitcoin_price_usd
+        .map(|price| (confirmed_sats as f64 / 100_000_000.0) * price);
+
+    BalanceReport {
         input_path: extract_report.wallet_path.clone(),
         network: extract_report.network.clone(),
-        address_count: balance_entries.len(),
-        esplora_base_url,
+        address_count: addresses.len(),
+        esplora_base_url: esplora_base_url.to_string(),
         bitcoin_price_usd,
         totals: BalanceTotals {
             confirmed_sats,
@@ -540,8 +590,113 @@ async fn build_balance_report(
             addresses_with_funds,
             estimated_confirmed_value_usd,
         },
-        addresses: balance_entries,
-    })
+        addresses,
+    }
+}
+
+fn load_resume_balance_entries(
+    extract_report: &ExtractReport,
+    esplora_base_url: &str,
+    output_path: &Path,
+) -> Result<Vec<BalanceEntry>> {
+    let Some(report) = read_balance_report_if_exists(output_path)? else {
+        return Ok(Vec::new());
+    };
+
+    validate_resume_report(extract_report, &report, esplora_base_url, output_path)?;
+    Ok(report.addresses)
+}
+
+fn read_balance_report_if_exists(path: &Path) -> Result<Option<BalanceReport>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    read_balance_report(path).map(Some)
+}
+
+fn validate_resume_report(
+    extract_report: &ExtractReport,
+    report: &BalanceReport,
+    esplora_base_url: &str,
+    output_path: &Path,
+) -> Result<()> {
+    if report.network != extract_report.network {
+        bail!(
+            "cannot resume from {}: network {} does not match current input {}",
+            output_path.display(),
+            report.network,
+            extract_report.network
+        );
+    }
+
+    if report.esplora_base_url != esplora_base_url {
+        bail!(
+            "cannot resume from {}: esplora URL {} does not match current URL {}",
+            output_path.display(),
+            report.esplora_base_url,
+            esplora_base_url
+        );
+    }
+
+    let spendable_by_address: HashMap<_, _> = extract_report
+        .spendable_addresses
+        .iter()
+        .map(|address| (address.address.as_str(), address))
+        .collect();
+    let mut seen_addresses = HashSet::new();
+
+    for entry in &report.addresses {
+        let Some(spendable) = spendable_by_address.get(entry.address.as_str()) else {
+            bail!(
+                "cannot resume from {}: address {} is not present in the current input",
+                output_path.display(),
+                entry.address
+            );
+        };
+
+        if !seen_addresses.insert(entry.address.as_str()) {
+            bail!(
+                "cannot resume from {}: address {} appears more than once",
+                output_path.display(),
+                entry.address
+            );
+        }
+
+        if !balance_entry_matches_spendable(entry, spendable) {
+            bail!(
+                "cannot resume from {}: saved metadata for address {} does not match the current input",
+                output_path.display(),
+                entry.address
+            );
+        }
+    }
+
+    if report.addresses.len() > extract_report.spendable_addresses.len() {
+        bail!(
+            "cannot resume from {}: saved report has more addresses than the current input",
+            output_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn balance_entry_matches_spendable(entry: &BalanceEntry, spendable: &SpendableAddress) -> bool {
+    entry.address == spendable.address
+        && entry.public_key == spendable.public_key
+        && entry.compressed == spendable.compressed
+        && entry.source_records == spendable.source_records
+        && entry.birth_time == spendable.birth_time
+        && entry.hd_keypath == spendable.hd_keypath
+        && entry.label == spendable.label
+        && entry.purpose == spendable.purpose
+}
+
+fn read_balance_report(path: &Path) -> Result<BalanceReport> {
+    info!(path = %path.display(), "Reading JSON report");
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 async fn fetch_address_stats(client: &Client, esplora_base_url: &str, address: &str) -> Result<EsploraAddressResponse> {
@@ -692,7 +847,73 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteCursor, KeyMetadata, parse_keymeta_record};
+    use super::{
+        BalanceEntry, BalanceReport, BalanceTotals, ByteCursor, ExtractReport, KeyMetadata,
+        SpendableAddress, assemble_balance_report, parse_keymeta_record, validate_resume_report,
+    };
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn sample_spendable_address(address: &str) -> SpendableAddress {
+        SpendableAddress {
+            address: address.to_string(),
+            public_key: format!("pubkey-{address}"),
+            compressed: true,
+            source_records: vec!["ckey".to_string()],
+            birth_time: Some(1_700_000_000),
+            hd_keypath: Some("m/0'/0'/0'".to_string()),
+            label: Some("label".to_string()),
+            purpose: Some("receive".to_string()),
+        }
+    }
+
+    fn sample_balance_entry(address: &str, confirmed_sats: u64) -> BalanceEntry {
+        let spendable = sample_spendable_address(address);
+        BalanceEntry {
+            address: spendable.address,
+            public_key: spendable.public_key,
+            compressed: spendable.compressed,
+            source_records: spendable.source_records,
+            birth_time: spendable.birth_time,
+            hd_keypath: spendable.hd_keypath,
+            label: spendable.label,
+            purpose: spendable.purpose,
+            confirmed_sats,
+            unconfirmed_sats: 0,
+            chain_tx_count: 1,
+            mempool_tx_count: 0,
+        }
+    }
+
+    fn sample_extract_report() -> ExtractReport {
+        ExtractReport {
+            wallet_path: "wallet.dat".to_string(),
+            network: "bitcoin".to_string(),
+            records_scanned: 1,
+            record_type_counts: BTreeMap::new(),
+            spendable_addresses: vec![
+                sample_spendable_address("addr-1"),
+                sample_spendable_address("addr-2"),
+            ],
+        }
+    }
+
+    fn sample_resume_report(addresses: Vec<BalanceEntry>) -> BalanceReport {
+        BalanceReport {
+            input_path: "wallet.dat".to_string(),
+            network: "bitcoin".to_string(),
+            address_count: addresses.len(),
+            esplora_base_url: "https://blockstream.info/api".to_string(),
+            bitcoin_price_usd: None,
+            totals: BalanceTotals {
+                confirmed_sats: addresses.iter().map(|entry| entry.confirmed_sats).sum(),
+                unconfirmed_sats: 0,
+                addresses_with_funds: addresses.len(),
+                estimated_confirmed_value_usd: None,
+            },
+            addresses,
+        }
+    }
 
     #[test]
     fn compact_size_and_string_parsing_work() {
@@ -747,5 +968,61 @@ mod tests {
         let metadata = KeyMetadata::default();
         assert_eq!(metadata.birth_time, None);
         assert_eq!(metadata.hd_keypath, None);
+    }
+
+    #[test]
+    fn resume_report_validation_accepts_matching_partial_output() {
+        let extract_report = sample_extract_report();
+        let report = sample_resume_report(vec![sample_balance_entry("addr-1", 42)]);
+
+        validate_resume_report(
+            &extract_report,
+            &report,
+            "https://blockstream.info/api",
+            Path::new("balances.json"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_report_validation_rejects_mismatched_saved_metadata() {
+        let extract_report = sample_extract_report();
+        let mut report = sample_resume_report(vec![sample_balance_entry("addr-1", 42)]);
+        report.addresses[0].public_key = "different-pubkey".to_string();
+
+        let error = validate_resume_report(
+            &extract_report,
+            &report,
+            "https://blockstream.info/api",
+            Path::new("balances.json"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("saved metadata for address addr-1 does not match the current input")
+        );
+    }
+
+    #[test]
+    fn assemble_balance_report_sorts_entries_and_recomputes_totals() {
+        let extract_report = sample_extract_report();
+        let report = assemble_balance_report(
+            &extract_report,
+            "https://blockstream.info/api",
+            Some(50_000.0),
+            &[
+                sample_balance_entry("addr-1", 10),
+                sample_balance_entry("addr-2", 20),
+            ],
+        );
+
+        assert_eq!(report.address_count, 2);
+        assert_eq!(report.addresses[0].address, "addr-2");
+        assert_eq!(report.addresses[1].address, "addr-1");
+        assert_eq!(report.totals.confirmed_sats, 30);
+        assert_eq!(report.totals.addresses_with_funds, 2);
+        assert_eq!(report.totals.estimated_confirmed_value_usd, Some(0.015));
     }
 }

@@ -42,6 +42,8 @@ bitcoin-recovery extract wallet.dat --output addresses.json
 
 Reads the JSON file produced by `extract` and queries an Esplora-compatible API for the confirmed/unconfirmed balance of each address.
 
+The command is resumable: it writes `balances.json` incrementally as each address is fetched. If the command is rerun with the same `--output`, the existing file is validated and used to skip addresses that were already completed.
+
 ```sh
 bitcoin-recovery balance <INPUT> [OPTIONS]
 ```
